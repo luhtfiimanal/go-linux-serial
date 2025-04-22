@@ -2,6 +2,7 @@ package serial
 
 import (
 	"fmt"
+	"log/slog"
 	"os"
 	"strings"
 	"sync"
@@ -133,6 +134,51 @@ func (s *SerialReader) ReadLine() (string, error) {
 	}
 }
 
+// Reopen closes and reopens the serial port with the same configuration.
+func (s *SerialReader) Reopen() error {
+	s.Close() // Clean up old fd, file, etc.
+	newReader, err := Open(s.config)
+	if err != nil {
+		return err
+	}
+	s.fd = newReader.fd
+		s.file = newReader.file
+		s.done = newReader.done
+		s.closeOnce = sync.Once{}
+		// Copy any other fields as needed
+	return nil
+}
+
+// ReadLinesWithReconnect wraps ReadLinesLoop with automatic reconnection logic.
+// maxRetries <= 0 means unlimited retries.
+func (s *SerialReader) ReadLinesWithReconnect(
+	onLine func(string),
+	onError func(error),
+	maxRetries int,
+) {
+	retries := 0
+	for {
+		s.ReadLinesLoop(onLine, func(err error) {
+			slog.Error("Serial read error", "error", err, "retry", retries)
+			onError(err)
+		})
+
+		retries++
+		if maxRetries > 0 && retries >= maxRetries {
+			slog.Error("Max retries reached, giving up", "maxRetries", maxRetries)
+			break
+		}
+
+		slog.Info("Attempting to reconnect serial port", "attempt", retries)
+		time.Sleep(1 * time.Second)
+
+		if err := s.Reopen(); err != nil {
+			slog.Error("Failed to reopen serial port", "error", err)
+			continue
+		}
+	}
+}
+
 // ReadLinesLoop reads lines with lowest latency, using poll and custom buffer, and reports errors immediately.
 // ReadLinesLoop continuously reads lines from the serial port and invokes onLine for each complete line.
 // If an error occurs, onError is called and the loop exits.
@@ -147,6 +193,9 @@ func (s *SerialReader) ReadLinesLoop(onLine func(string), onError func(error)) {
 		}
 		_, err := unix.Poll(pfd, -1)
 		if err != nil {
+			if err == syscall.EINTR {
+				continue // Retry on interrupted system call
+			}
 			onError(err)
 			return
 		}
@@ -165,6 +214,9 @@ func (s *SerialReader) ReadLinesLoop(onLine func(string), onError func(error)) {
 		if pfd[0].Revents&unix.POLLIN != 0 {
 			n, err := s.file.Read(buf)
 			if err != nil {
+				if err == syscall.EINTR {
+					continue // Retry on interrupted system call
+				}
 				onError(err)
 				return
 			}
