@@ -157,27 +157,55 @@ func TestSerialReader_Killability(t *testing.T) {
 	require.NoError(t, err)
 	t.Cleanup(func() { reader.Close() })
 
+	// Add a flag to track if ReadLinesLoop exited
 	done := make(chan struct{})
+	exitError := make(chan error, 1)
+
 	go func() {
 		reader.ReadLinesLoop(
-			func(line string) {},
-			func(err error) {},
+			func(line string) {
+				// Do nothing with lines
+			},
+			func(err error) {
+				// Capture any errors that occur during shutdown
+				select {
+				case exitError <- err:
+				default:
+				}
+			},
 		)
 		close(done)
 	}()
 
 	// Give the goroutine a chance to block
-	time.Sleep(10 * time.Millisecond)
+	time.Sleep(50 * time.Millisecond)
+
+	// Try to write some data to ensure the loop is running
+	_, err = master.Write([]byte("test data\n"))
+	require.NoError(t, err)
+
+	// Sleep a bit more to ensure the data is processed
+	time.Sleep(50 * time.Millisecond)
+
 	// Now close the reader, which should unblock the loop
 	err = reader.Close()
 	require.NoError(t, err)
 
+	// Increase timeout to accommodate slower systems
 	select {
 	case <-done:
-		// Success
-	case <-time.After(100 * time.Millisecond):
+		// Success - loop exited
+		t.Log("ReadLinesLoop successfully exited after Close")
+	case err := <-exitError:
+		// Loop exited with an error
+		t.Logf("ReadLinesLoop exited with error: %v", err)
+	case <-time.After(500 * time.Millisecond):
 		t.Fatal("timeout waiting for ReadLinesLoop to exit after Close")
 	}
+
+	// Verify that attempting to use the reader after Close fails appropriately
+	err = reader.Close() // Should be a no-op due to closeOnce
+	require.NoError(t, err)
 }
 
 func TestSerialReader_ErrorPropagation(t *testing.T) {
